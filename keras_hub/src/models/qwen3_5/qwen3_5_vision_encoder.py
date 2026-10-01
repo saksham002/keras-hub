@@ -223,7 +223,7 @@ class Qwen3_5VisionAttention(keras.layers.Layer):
         rotated = ops.concatenate([-x2, x1], axis=-1)
         return (x * cos_emb) + (rotated * sin_emb)
 
-    def call(self, x, position_embeddings, cu_seqlens=None):
+    def call(self, x, position_embeddings, cu_seqlens=None, num_segments=None):
         """Apply multi-head attention with optional windowing.
 
         Args:
@@ -233,6 +233,10 @@ class Qwen3_5VisionAttention(keras.layers.Layer):
             cu_seqlens: int32 cumulative sequence lengths
                 ``(num_chunks + 1,)`` for per-frame
                 attention windowing. ``None`` for full.
+            num_segments: int or None. When set, ``x`` is split into this
+                many equal-length windows that attend independently. Unlike
+                ``cu_seqlens`` this needs no concrete tensor values, so it
+                works under ``jit``. Takes precedence over ``cu_seqlens``.
         Returns:
             Tensor ``(seq_len, hidden_size)``.
         """
@@ -250,7 +254,25 @@ class Qwen3_5VisionAttention(keras.layers.Layer):
         k = ops.transpose(k, (1, 0, 2))
         v = ops.transpose(v, (1, 0, 2))
 
-        if cu_seqlens is not None and len(cu_seqlens) > 2:
+        if num_segments is not None:
+            # Equal-length windows (one per image): attend within each
+            # window with a single batched einsum.
+            q_s = ops.reshape(
+                q, (self.num_heads, num_segments, -1, self.head_dim)
+            )
+            k_s = ops.reshape(
+                k, (self.num_heads, num_segments, -1, self.head_dim)
+            )
+            v_s = ops.reshape(
+                v, (self.num_heads, num_segments, -1, self.head_dim)
+            )
+            sc = ops.einsum("hsid,hsjd->hsij", q_s, k_s) * self._inv_scale
+            sc = ops.cast(sc, "float32")
+            sc = ops.softmax(sc, axis = -1)
+            sc = ops.cast(sc, self.compute_dtype)
+            out = ops.einsum("hsij,hsjd->hsid", sc, v_s)
+            out = ops.reshape(out, (self.num_heads, -1, self.head_dim))
+        elif cu_seqlens is not None and len(cu_seqlens) > 2:
             # Windowed attention: each chunk attends
             # independently (one window per frame).
             cu_np = ops.convert_to_numpy(cu_seqlens)
@@ -322,13 +344,18 @@ class Qwen3_5VisionBlock(keras.layers.Layer):
         self.mlp.build(input_shape)
         self.built = True
 
-    def call(self, x, position_embeddings, cu_seqlens=None):
+    def call(self, x, position_embeddings, cu_seqlens=None, num_segments=None):
         # Vision always runs in float32 for stability.
         x = ops.cast(x, "float32")
 
         normed = self.norm1(x)
         normed = ops.cast(normed, self.compute_dtype)
-        attn_out = self.attn(normed, position_embeddings, cu_seqlens)
+        attn_out = self.attn(
+            normed,
+            position_embeddings,
+            cu_seqlens,
+            num_segments = num_segments,
+        )
         attn_out = ops.cast(attn_out, "float32")
         x = x + attn_out
 
@@ -447,6 +474,17 @@ class Qwen3_5VisionEncoder(keras.Model):
         spatial_merge_size: int. Spatial merge downsampling factor.
         out_hidden_size: int. Projection output dim (= text backbone hidden).
         num_position_embeddings: int. Max absolute position embeddings.
+        fixed_image_size: tuple ``(height, width)`` in pixels, or None. When
+            set, every input is assumed to be a still image of this size
+            (``grid_thw = (1, height / patch_size, width / patch_size)``) and
+            the values in ``grid_thw`` are ignored. All position tables and
+            per-image attention windows are then built from static shapes,
+            which is what lets the encoder run inside a jitted train step
+            (e.g. ``fit()`` on the JAX backend). Can also be set on a loaded
+            model: ``backbone.vision_encoder.fixed_image_size = (256, 256)``.
+            Height and width must be multiples of
+            ``patch_size * spatial_merge_size``. Defaults to None, which
+            reads ``grid_thw`` eagerly and supports mixed sizes and video.
         dtype: compute dtype.
     """
 
@@ -462,6 +500,7 @@ class Qwen3_5VisionEncoder(keras.Model):
         spatial_merge_size=2,
         out_hidden_size=None,
         num_position_embeddings=2304,
+        fixed_image_size=None,
         dtype=None,
         **kwargs,
     ):
@@ -481,6 +520,7 @@ class Qwen3_5VisionEncoder(keras.Model):
         self.spatial_merge_size = spatial_merge_size
         self.out_hidden_size = out_hidden_size or hidden_size
         self.num_position_embeddings = num_position_embeddings
+        self.fixed_image_size = fixed_image_size
 
         head_dim = hidden_size // num_heads
 
@@ -773,6 +813,49 @@ class Qwen3_5VisionEncoder(keras.Model):
         hidden_states = self.patch_embed(pixel_values)
         hidden_states = ops.cast(hidden_states, "float32")
 
+        if self.fixed_image_size is not None:
+            # Static path: every image has the same grid, so positions are
+            # built once from Python ints and tiled, and attention windows
+            # come from a reshape. No tensor values are read.
+            grid_h = self.fixed_image_size[0] // self.patch_size
+            grid_w = self.fixed_image_size[1] // self.patch_size
+            patches_per_image = grid_h * grid_w
+            if num_patches % patches_per_image != 0:
+                raise ValueError(
+                    f"`fixed_image_size={self.fixed_image_size}` implies "
+                    f"{patches_per_image} patches per image, but the input "
+                    f"has {num_patches} patches, which is not a multiple."
+                )
+            num_images = num_patches // patches_per_image
+            static_grid = [[1, grid_h, grid_w]]
+
+            # 2. Absolute position embedding.
+            pos_embeds = self._fast_pos_embed_interpolate(static_grid)
+            hidden_states = hidden_states + ops.tile(
+                pos_embeds, (num_images, 1)
+            )
+
+            # 3. Rotary position embedding.
+            cos_emb, sin_emb = self._rot_pos_emb(static_grid)
+            position_embeddings = (
+                ops.tile(cos_emb, (num_images, 1)),
+                ops.tile(sin_emb, (num_images, 1)),
+            )
+
+            # 4. ViT blocks, attending within each image.
+            for blk in self.blocks:
+                hidden_states = blk(
+                    hidden_states,
+                    position_embeddings,
+                    num_segments = num_images,
+                )
+
+            # 5. Patch merger.
+            merged = self.merger(hidden_states)
+            if batched:
+                merged = ops.expand_dims(merged, axis = 0)
+            return merged
+
         # 2. Absolute position embedding.
         pos_embeds = self._fast_pos_embed_interpolate(grid_thw)
         hidden_states = hidden_states + pos_embeds
@@ -837,4 +920,5 @@ class Qwen3_5VisionEncoder(keras.Model):
             "spatial_merge_size": self.spatial_merge_size,
             "out_hidden_size": self.out_hidden_size,
             "num_position_embeddings": self.num_position_embeddings,
+            "fixed_image_size": self.fixed_image_size,
         }

@@ -15,6 +15,8 @@ from keras_hub.src.models.qwen3_5.qwen3_5_video_converter import (
     Qwen3_5VideoConverter,
 )
 from keras_hub.src.utils.tensor_utils import assert_tf_installed
+from keras_hub.src.utils.tensor_utils import convert_to_numpy
+from keras_hub.src.utils.tensor_utils import in_tf_function
 from keras_hub.src.utils.tensor_utils import preprocessing_function
 from keras_hub.src.utils.tensor_utils import strip_to_ragged
 
@@ -312,6 +314,17 @@ class Qwen3_5CausalLMPreprocessor(CausalLMPreprocessor):
         return prompt, num_video_tokens_per_frame
 
     def _compute_position_ids(self, token_ids, image_grid_thw, video_grid_thw):
+        """Tensor-returning wrapper around ``_compute_position_ids_np``."""
+        return tf.constant(
+            self._compute_position_ids_np(
+                token_ids, image_grid_thw, video_grid_thw
+            ),
+            dtype = "int32",
+        )
+
+    def _compute_position_ids_np(
+        self, token_ids, image_grid_thw, video_grid_thw
+    ):
         """Build 4-channel M-RoPE position IDs matching HF's algorithm.
 
         For text tokens all 4 channels have the same sequential position.
@@ -334,7 +347,7 @@ class Qwen3_5CausalLMPreprocessor(CausalLMPreprocessor):
             image_grid_thw: int32 tensor ``(num_images, 3)``.
             video_grid_thw: int32 tensor ``(num_videos, 3)``.
         Returns:
-            int32 tensor ``(batch, 4, seq_len)``.
+            int32 numpy array ``(batch, 4, seq_len)``.
         """
         token_ids_np = ops.convert_to_numpy(token_ids)
         if hasattr(image_grid_thw, "numpy"):
@@ -455,7 +468,249 @@ class Qwen3_5CausalLMPreprocessor(CausalLMPreprocessor):
             all_pos[b, 2] = h_pos
             all_pos[b, 3] = w_pos
 
-        return tf.constant(all_pos, dtype="int32")
+        return all_pos
+
+    def call(self, x, y=None, sample_weight=None, sequence_length=None):
+        """Preprocess a training batch.
+
+        Plain strings take the base text-only path (loss on every token).
+
+        A dict with ``"prompts"`` and ``"responses"`` (and, for a
+        multimodal model, optional ``"images"``) is turned into supervised
+        fine-tuning inputs with the loss on the response tokens only:
+
+        - ``"prompts"``: str or list of str. Each image is referenced by a
+          ``<|vision_start|><|image_pad|><|vision_end|>`` placeholder, in
+          the same order as the images.
+        - ``"responses"``: str or list of str, the target text.
+        - ``"images"``: for a single sample, a ``(num_images, H, W, 3)``
+          array or a list of ``(H, W, 3)`` images; for a batch, a
+          ``(batch, num_images, H, W, 3)`` array or a list (one entry per
+          sample) of those. Pixel values in ``[0, 255]``.
+
+        Returns ``(x, y, sample_weight)`` where ``x`` holds ``token_ids``,
+        ``padding_mask`` and ``position_ids`` (M-RoPE, ``(4, seq_len)`` per
+        sample), plus ``pixel_values``, ``image_grid_thw`` and
+        ``vision_indices`` (positions within the sample's sequence) for a
+        multimodal model. ``y`` is the next token and ``sample_weight`` is
+        1 on response tokens (and the end token) and 0 elsewhere.
+
+        This path runs eagerly in Python (it cannot be traced inside
+        ``tf.data``). Preprocess samples one at a time and stack them, or
+        pass batches in which every sample has the same number and size of
+        images. Use the result with ``Qwen3_5CausalLM(..., preprocessor=
+        None)`` or ``model.fit(x, y, sample_weight=...)`` on the arrays.
+        """
+        if not (isinstance(x, dict) and "responses" in x):
+            return super().call(
+                x,
+                y = y,
+                sample_weight = sample_weight,
+                sequence_length = sequence_length,
+            )
+        if in_tf_function():
+            raise ValueError(
+                "`Qwen3_5CausalLMPreprocessor` with `prompts`/`responses` "
+                "inputs runs eagerly and cannot be traced inside `tf.data` "
+                "or a `tf.function`. Call it in Python (e.g. in a Grain or "
+                "plain Python data loader) and feed the resulting arrays."
+            )
+        if not self.built:
+            self.build(None)
+        sequence_length = sequence_length or self.sequence_length
+
+        prompts, batched = self._as_string_list(x["prompts"])
+        responses, _ = self._as_string_list(x["responses"])
+        if len(prompts) != len(responses):
+            raise ValueError(
+                f"Got {len(prompts)} prompts but {len(responses)} responses."
+            )
+        images = self._as_per_sample_images(
+            x.get("images", None), len(prompts), batched
+        )
+        if images is not None and self.image_converter is None:
+            raise ValueError(
+                "`images` were passed, but this preprocessor has no "
+                "`image_converter` (text-only model)."
+            )
+
+        samples = [
+            self._sft_sample(
+                prompts[b],
+                responses[b],
+                images[b] if images is not None else [],
+                sequence_length,
+            )
+            for b in range(len(prompts))
+        ]
+
+        token_ids = np.stack([s["token_ids"] for s in samples])
+        padding_mask = np.stack([s["padding_mask"] for s in samples])
+        loss_mask = np.stack([s["loss_mask"] for s in samples])
+        position_ids = np.stack([s["position_ids"] for s in samples])
+
+        # The last token has no next token, so it is dropped from `x`.
+        x_out = {
+            "token_ids": token_ids[:, :-1],
+            "padding_mask": padding_mask[:, :-1],
+            "position_ids": position_ids,
+        }
+        y_out = token_ids[:, 1:]
+        sample_weight_out = loss_mask[:, 1:].astype("float32")
+
+        if self.image_converter is not None:
+            for key in ("pixel_values", "image_grid_thw", "vision_indices"):
+                shapes = {s[key].shape for s in samples}
+                if len(shapes) > 1:
+                    raise ValueError(
+                        f"Samples in a batch produced `{key}` of different "
+                        f"shapes {sorted(shapes)}. Every sample in a batch "
+                        "needs the same number and size of images. "
+                        "Preprocess samples one at a time instead."
+                    )
+                x_out[key] = np.stack([s[key] for s in samples])
+
+        if not batched:
+            x_out = {k: v[0] for k, v in x_out.items()}
+            y_out = y_out[0]
+            sample_weight_out = sample_weight_out[0]
+        return keras.utils.pack_x_y_sample_weight(
+            x_out, y_out, sample_weight_out
+        )
+
+    def _sft_sample(self, prompt, response, sample_images, sequence_length):
+        """Tokenize, pack and build vision inputs for one SFT sample.
+
+        Returns numpy arrays of length ``sequence_length + 1`` for the token
+        fields (one extra token for the shift into ``y``) and
+        ``sequence_length`` for ``position_ids``.
+        """
+        num_placeholders = prompt.count(self.image_token)
+        if num_placeholders != len(sample_images):
+            raise ValueError(
+                f"The prompt has {num_placeholders} `{self.image_token}` "
+                f"placeholders but {len(sample_images)} images were given. "
+                f"Prompt: {prompt!r}"
+            )
+
+        patches, grids = [], []
+        for image in sample_images:
+            converted = self.image_converter(image)
+            patches.append(convert_to_numpy(converted["patches"]))
+            grids.append(convert_to_numpy(converted["grid_thw"]))
+        merge_size = getattr(self.image_converter, "spatial_merge_size", 2)
+        num_image_tokens = [
+            int(g[0]) * (int(g[1]) // merge_size) * (int(g[2]) // merge_size)
+            for g in grids
+        ]
+
+        prompt_ids = self._tokenize_with_special_tokens(
+            prompt, num_image_tokens, []
+        )
+        response_ids = self._tokenize_with_special_tokens(response, [], [])
+        start_ids = (
+            [self.tokenizer.start_token_id] if self.add_start_token else []
+        )
+        end_ids = [self.tokenizer.end_token_id] if self.add_end_token else []
+
+        ids = start_ids + prompt_ids + response_ids + end_ids
+        loss_mask = [0] * (len(start_ids) + len(prompt_ids)) + [1] * (
+            len(response_ids) + len(end_ids)
+        )
+
+        # Truncate from the end, but never through an image.
+        total_length = sequence_length + 1
+        if len(ids) > total_length:
+            if self.image_token_id in ids[total_length - 1 :]:
+                raise ValueError(
+                    f"`sequence_length={sequence_length}` is too short to "
+                    f"fit the image tokens of a sample that needs "
+                    f"{len(ids) - 1} tokens. Increase `sequence_length`."
+                )
+            ids = ids[:total_length]
+            loss_mask = loss_mask[:total_length]
+        num_pad = total_length - len(ids)
+        padding_mask = [True] * len(ids) + [False] * num_pad
+        ids = ids + [self.tokenizer.pad_token_id] * num_pad
+        loss_mask = loss_mask + [0] * num_pad
+
+        token_ids = np.array(ids, dtype = "int32")
+        grid_array = (
+            np.stack(grids).astype("int32")
+            if grids
+            else np.zeros((0, 3), dtype = "int32")
+        )
+        position_ids = self._compute_position_ids_np(
+            token_ids[None, :-1],
+            grid_array if grids else None,
+            None,
+        )[0]
+
+        sample = {
+            "token_ids": token_ids,
+            "padding_mask": np.array(padding_mask, dtype = "bool"),
+            "loss_mask": np.array(loss_mask, dtype = "int32"),
+            "position_ids": position_ids.astype("int32"),
+        }
+        if self.image_converter is not None:
+            ic = self.image_converter
+            patch_shape = (
+                ic.temporal_patch_size,
+                ic.patch_size,
+                ic.patch_size,
+                3,
+            )
+            sample["pixel_values"] = (
+                np.concatenate(patches).astype("float32")
+                if patches
+                else np.zeros((0, *patch_shape), dtype = "float32")
+            )
+            sample["image_grid_thw"] = grid_array
+            sample["vision_indices"] = np.where(
+                token_ids[:-1] == self.image_token_id
+            )[0].astype("int32")
+        return sample
+
+    @staticmethod
+    def _as_string_list(value):
+        """Return ``(list_of_str, batched)`` for str/bytes/array/list input."""
+
+        def _decode(v):
+            return v.decode("utf-8") if isinstance(v, bytes) else str(v)
+
+        if isinstance(value, (str, bytes)):
+            return [_decode(value)], False
+        if not isinstance(value, (list, tuple)):
+            array = convert_to_numpy(value)
+            if array.ndim == 0:
+                return [_decode(array.item())], False
+            return [_decode(v) for v in array.tolist()], True
+        return [_decode(v) for v in value], True
+
+    @staticmethod
+    def _as_per_sample_images(images, batch_size, batched):
+        """Normalize ``images`` to a list (per sample) of ``(H, W, 3)``
+        numpy arrays, or ``None``."""
+        if images is None:
+            return None
+        if not batched:
+            images = [images]
+        if not isinstance(images, (list, tuple)):
+            images = list(convert_to_numpy(images))
+        if len(images) != batch_size:
+            raise ValueError(
+                f"Got images for {len(images)} samples but {batch_size} "
+                "prompts."
+            )
+        per_sample = []
+        for sample_images in images:
+            if not isinstance(sample_images, (list, tuple)):
+                sample_images = convert_to_numpy(sample_images)
+                if sample_images.ndim == 3:
+                    sample_images = sample_images[None]
+                sample_images = list(sample_images)
+            per_sample.append([convert_to_numpy(i) for i in sample_images])
+        return per_sample
 
     @preprocessing_function
     def generate_preprocess(self, x, sequence_length=None):

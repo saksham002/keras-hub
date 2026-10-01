@@ -30,13 +30,16 @@ class Qwen3_5InterleaveEmbeddings(keras.layers.Layer):
             vision_indices ``(total_vision_tokens,)``.
         - Batched (from backbone functional graph):
             image_embeddings ``(batch, total_vision_tokens, hidden_dim)``,
-            vision_indices ``(batch, total_vision_tokens)``.
+            vision_indices ``(batch, vision_tokens_per_sample)``.
 
         Args:
             image_embeddings: Tensor with visual token embeddings.
             text_embeddings: Tensor ``(batch, seq_len, hidden_dim)``.
-            vision_indices: int32 Tensor with flat indices into the
-                concatenated ``(batch × seq_len)`` sequence.
+            vision_indices: int32 Tensor. A 1D tensor holds flat indices
+                into the concatenated ``(batch × seq_len)`` sequence. A 2D
+                ``(batch, n)`` tensor holds, per row, positions within that
+                row's sequence; the row offset is added here, so samples can
+                be preprocessed independently and then stacked.
 
         Returns:
             Tensor ``(batch, seq_len, hidden_dim)`` with visual tokens
@@ -52,6 +55,10 @@ class Qwen3_5InterleaveEmbeddings(keras.layers.Layer):
                 image_embeddings, (-1, self.hidden_dim)
             )
         if len(ops.shape(vision_indices)) == 2:
+            row_offsets = ops.expand_dims(
+                ops.arange(batch_size, dtype = "int32") * seq_len, axis = 1
+            )
+            vision_indices = ops.cast(vision_indices, "int32") + row_offsets
             vision_indices = ops.reshape(vision_indices, (-1,))
 
         # Flatten the text embedding to (batch * seq_len, hidden_dim).

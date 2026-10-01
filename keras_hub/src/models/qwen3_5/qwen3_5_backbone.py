@@ -110,7 +110,11 @@ class Qwen3_5Backbone(Backbone):
             *pairs* of rotary dimensions assigned to temporal, height,
             and width axes. Required for M-RoPE in multimodal mode.
             e.g. ``[11, 11, 10]`` for the 27B model. Defaults to ``None``
-            (plain 1D RoPE).
+            (plain 1D RoPE). When set, the backbone takes an optional
+            ``position_ids`` input of shape ``(batch, 4, seq_len)``
+            (text, temporal, height, width), as produced by
+            ``Qwen3_5CausalLMPreprocessor``; omitting it falls back to 1D
+            RoPE, which is exact only for text-only sequences.
         dtype: string or ``keras.mixed_precision.DTypePolicy``. The
             dtype to use for model computations and weights.
     """
@@ -226,6 +230,17 @@ class Qwen3_5Backbone(Backbone):
         padding_mask_input = keras.Input(
             shape=(None,), dtype="int32", name="padding_mask"
         )
+        # M-RoPE positions (text, temporal, height, width) per token, only
+        # used when `mrope_section` is set. When `None`, the full-attention
+        # layers use plain 1D RoPE, which is exact for text-only sequences.
+        position_ids_input = None
+        if mrope_section is not None:
+            position_ids_input = keras.Input(
+                shape = (4, None),
+                dtype = "int32",
+                name = "position_ids",
+                optional = True,
+            )
 
         # Text embeddings.
         text_embeddings = self.token_embedding(token_id_input)
@@ -245,7 +260,11 @@ class Qwen3_5Backbone(Backbone):
 
         # Transformer layers.
         for transformer_layer in self.transformer_layers:
-            x = transformer_layer(x, decoder_padding_mask=padding_mask_input)
+            x = transformer_layer(
+                x,
+                decoder_padding_mask = padding_mask_input,
+                position_ids = position_ids_input,
+            )
 
         sequence_output = self.layer_norm(x)
 
@@ -253,6 +272,8 @@ class Qwen3_5Backbone(Backbone):
             "token_ids": token_id_input,
             "padding_mask": padding_mask_input,
         }
+        if position_ids_input is not None:
+            inputs["position_ids"] = position_ids_input
         if not text_only_model:
             inputs.update(
                 {
@@ -303,8 +324,30 @@ class Qwen3_5Backbone(Backbone):
         and allows users to call the backbone with only ``token_ids``
         and ``padding_mask``.
         """
-        if isinstance(inputs, dict) and not self.text_only_model:
-            inputs = dict(inputs)  # shallow copy to avoid mutation
+        inputs = self._fill_default_inputs(inputs)
+        return super().__call__(inputs, *args, **kwargs)
+
+    def call(self, inputs, *args, **kwargs):
+        # `predict()`/`fit()` on the JAX backend reach `call` through
+        # `stateless_call`, bypassing `__call__`.
+        inputs = self._fill_default_inputs(inputs)
+        return super().call(inputs, *args, **kwargs)
+
+    def _fill_default_inputs(self, inputs):
+        """Return ``inputs`` with every optional graph input present.
+
+        ``position_ids`` (an input only when ``mrope_section`` is set)
+        defaults to ``None`` (plain 1D RoPE) and, for a multimodal backbone,
+        the vision inputs default to zero-sized tensors. Shared with
+        ``Qwen3_5CausalLM.call``, which the JAX trainer invokes directly
+        without going through ``__call__``.
+        """
+        if not isinstance(inputs, dict):
+            return inputs
+        inputs = dict(inputs)  # shallow copy to avoid mutation
+        if self.mrope_section is not None:
+            inputs.setdefault("position_ids", None)
+        if not self.text_only_model:
             batch_size = ops.shape(inputs["token_ids"])[0]
             ve = self.vision_encoder
             if "pixel_values" not in inputs:
@@ -326,7 +369,7 @@ class Qwen3_5Backbone(Backbone):
                 inputs["vision_indices"] = ops.zeros(
                     (batch_size, 0), dtype="int32"
                 )
-        return super().__call__(inputs, *args, **kwargs)
+        return inputs
 
     def get_config(self):
         config = super().get_config()

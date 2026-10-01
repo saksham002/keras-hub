@@ -46,6 +46,17 @@ class Qwen3_5CausalLM(CausalLM):
             **kwargs,
         )
 
+    def __call__(self, inputs, *args, **kwargs):
+        inputs = self.backbone._fill_default_inputs(inputs)
+        return super().__call__(inputs, *args, **kwargs)
+
+    def call(self, inputs, *args, **kwargs):
+        # The JAX trainer reaches `call` through `stateless_call`, bypassing
+        # `__call__`, so optional inputs (e.g. `position_ids` for text-only
+        # batches) are filled in here.
+        inputs = self.backbone._fill_default_inputs(inputs)
+        return super().call(inputs, *args, **kwargs)
+
     def call_with_cache(
         self,
         token_ids,

@@ -170,11 +170,23 @@ class Qwen3_5ImageConverter(ImageConverter):
         grid_w = target_w // self.patch_size
 
         # Extract patches.
+        # Patches are ordered block by block over spatial_merge_size x
+        # spatial_merge_size windows (as in HF's processor), so that the
+        # vision merger can group each run of consecutive patches.
+        ms = self.spatial_merge_size
         image = tf.reshape(
             image,
-            (grid_h, self.patch_size, grid_w, self.patch_size, 3),
+            (
+                grid_h // ms,
+                ms,
+                self.patch_size,
+                grid_w // ms,
+                ms,
+                self.patch_size,
+                3,
+            ),
         )
-        image = tf.transpose(image, (0, 2, 1, 3, 4))
+        image = tf.transpose(image, (0, 3, 1, 4, 2, 5, 6))
         num_patches = grid_h * grid_w
         image = tf.reshape(
             image, (num_patches, self.patch_size, self.patch_size, 3)
@@ -258,11 +270,23 @@ class Qwen3_5ImageConverter(ImageConverter):
         grid_w = target_w // self.patch_size
 
         # Extract patches.
+        # Patches are ordered block by block over spatial_merge_size x
+        # spatial_merge_size windows (as in HF's processor), so that the
+        # vision merger can group each run of consecutive patches.
+        ms = self.spatial_merge_size
         image = ops.reshape(
             image,
-            (grid_h, self.patch_size, grid_w, self.patch_size, 3),
+            (
+                grid_h // ms,
+                ms,
+                self.patch_size,
+                grid_w // ms,
+                ms,
+                self.patch_size,
+                3,
+            ),
         )
-        image = ops.transpose(image, (0, 2, 1, 3, 4))
+        image = ops.transpose(image, (0, 3, 1, 4, 2, 5, 6))
         num_patches = grid_h * grid_w
         image = ops.reshape(
             image, (num_patches, self.patch_size, self.patch_size, 3)
