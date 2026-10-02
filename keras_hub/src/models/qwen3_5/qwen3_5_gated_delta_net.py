@@ -40,6 +40,23 @@ def _causal_conv1d(x, weight, bias=None):
     return out
 
 
+def _mask_state_updates(beta, g, padding_mask):
+    """Make masked tokens no-ops for the recurrent state.
+
+    With ``beta = 0`` a token writes nothing and with ``g = 0`` the state is
+    not decayed, so padded positions leave the state exactly as it was.
+
+    Args:
+        beta: (B, num_heads, seq) write gates.
+        g: (B, num_heads, seq) log-space decays.
+        padding_mask: (B, seq) mask or None.
+    """
+    if padding_mask is None:
+        return beta, g
+    mask = ops.expand_dims(ops.cast(padding_mask, "float32"), axis = 1)
+    return beta * mask, g * mask
+
+
 def _chunk_gated_delta_rule(
     query,
     key,
@@ -82,6 +99,7 @@ def _chunk_gated_delta_rule(
     value = ops.cast(value, "float32")
     beta = ops.cast(beta, "float32")
     g = ops.cast(g, "float32")
+    beta, g = _mask_state_updates(beta, g, padding_mask)
 
     batch_size = ops.shape(key)[0]
     num_heads = ops.shape(key)[1]
@@ -253,6 +271,7 @@ def _recurrent_gated_delta_rule(
     value = ops.cast(value, "float32")
     beta = ops.cast(beta, "float32")
     g = ops.cast(g, "float32")
+    beta, g = _mask_state_updates(beta, g, padding_mask)
 
     batch_size = ops.shape(key)[0]
     num_heads = ops.shape(key)[1]

@@ -170,6 +170,48 @@ class Qwen3_5SFTTest(TestCase):
         for key in x:
             self.assertAllEqual(single[0][key], x[key][1])
 
+    def test_cached_greedy_decoding_matches_full_forward(self):
+        # The linear-attention state is cumulative, so prefill/decode
+        # bookkeeping errors (padding or a token processed twice) show up as
+        # cached decoding disagreeing with an uncached forward pass.
+        keras.utils.set_random_seed(86)
+        backbone = Qwen3_5Backbone(
+            vocabulary_size = 50,
+            num_layers = 4,
+            num_query_heads = 2,
+            num_key_value_heads = 1,
+            head_dim = 8,
+            hidden_dim = 16,
+            intermediate_dim = 32,
+            layer_types = ["linear_attention"] * 3 + ["full_attention"],
+            linear_num_key_heads = 2,
+            linear_num_value_heads = 2,
+            linear_key_head_dim = 4,
+            linear_value_head_dim = 4,
+        )
+        model = Qwen3_5CausalLM(backbone = backbone, preprocessor = None)
+        model.compile(sampler = "greedy")
+        token_ids = np.zeros((2, 12), dtype = "int32")
+        token_ids[0, :3] = [5, 9, 12]
+        token_ids[1, :5] = [7, 3, 22, 30, 41]
+        padding_mask = token_ids != 0
+        out = model.generate(
+            {"token_ids": token_ids, "padding_mask": padding_mask},
+            stop_token_ids = None,
+        )
+        out_ids = keras.ops.convert_to_numpy(out["token_ids"])
+        logits = model(
+            {
+                "token_ids": out_ids,
+                "padding_mask": np.ones_like(out_ids),
+            }
+        )
+        predicted = np.argmax(keras.ops.convert_to_numpy(logits), axis = -1)
+        for row, prompt_len in enumerate([3, 5]):
+            self.assertAllEqual(
+                out_ids[row, prompt_len:], predicted[row, prompt_len - 1 : -1]
+            )
+
     @pytest.mark.skipif(
         keras.config.backend() == "tensorflow",
         reason = "The vision encoder branches on the patch count, which is "

@@ -231,24 +231,57 @@ class Qwen3_5CausalLM(CausalLM):
                 pixel_values, image_grid_thw
             )
 
+        row_lengths = ops.sum(ops.cast(padding_mask, "int32"), axis=-1)
+        index = ops.min(row_lengths)
+
+        # The sampler's first step re-feeds token `index - 1`, and later steps
+        # feed any longer rows' remaining prompt tokens. That is harmless for
+        # the KV cache (slots are overwritten) but the linear-attention state
+        # is cumulative, so the prefill may only consume tokens before
+        # `index - 1`; padding and everything after are masked out.
+        seq_positions = ops.arange(ops.shape(token_ids)[1], dtype = "int32")
+        prefill_mask = ops.logical_and(
+            ops.cast(padding_mask, "bool"),
+            ops.expand_dims(seq_positions < index - 1, axis = 0),
+        )
         hidden_states, cache = self._build_cache(
             token_ids,
-            padding_mask,
+            prefill_mask,
             img_embeddings=img_embeddings,
             vision_indices=vision_indices,
             position_ids=position_ids,
         )
-        row_lengths = ops.sum(ops.cast(padding_mask, "int32"), axis=-1)
-        index = ops.min(row_lengths)
+
+        # With M-RoPE, text after an image continues from a position smaller
+        # than its token index (an image advances positions by
+        # max(grid_h, grid_w), not by its token count). Decode steps need
+        # that per-sample offset (HF's `rope_deltas`). The preprocessor
+        # numbers padding like text, so the offset is read off the last slot.
+        rope_deltas = None
+        if position_ids is not None:
+            seq_len = ops.shape(token_ids)[1]
+            rope_deltas = ops.cast(position_ids[:, 0, -1], "int32") - (
+                seq_len - 1
+            )
 
         def next(prompt, cache, index):
             cache_update_index = index - 1
             batch_size = ops.shape(prompt)[0]
             prompt = ops.slice(prompt, [0, cache_update_index], [batch_size, 1])
+            step_position_ids = None
+            if rope_deltas is not None:
+                step = ops.cast(cache_update_index, "int32") + rope_deltas
+                step_position_ids = ops.tile(
+                    ops.reshape(step, (-1, 1, 1)), (1, 4, 1)
+                )
             # No vision inputs during autoregressive generation — they
             # are already baked into the KV cache from the prefill step.
             logits, hidden_states, cache = self.call_with_cache(
-                prompt, cache, cache_update_index, padding_mask=None
+                prompt,
+                cache,
+                cache_update_index,
+                padding_mask = None,
+                position_ids = step_position_ids,
             )
             return (
                 ops.squeeze(logits, axis=1),
