@@ -20,6 +20,29 @@ transformers.
 | `tools/qwen3_5/check_sft_parity.py` | End-to-end check against HF (tokens, pixels, positions, logits under jit, `fit()`). |
 | `tools/qwen3_5/check_generate_photo.py` | Greedy image + text generation on a real photo with Qwen3.5-0.8B, keras-hub vs HF. |
 
+## TPU-oriented gated delta rule
+
+Set `KERAS_HUB_QWEN3_5_GDN_IMPL` to choose the chunked gated delta rule used by
+the linear-attention layers (training forward pass and the decode prefill):
+
+| Value | Implementation |
+| --- | --- |
+| `reference` (default, or unset) | The backend-agnostic rule in `qwen3_5_gated_delta_net.py`: each chunk's `(I - A)^-1` by a 63-step row loop, chunks as an unrolled Python loop. |
+| `tpu` (JAX only) | `qwen3_5_gated_delta_rule_tpu.py`: the inverse by six levels of masked block doubling (two full chunk x chunk matmuls per level at full float32 precision), all chunks' intra-chunk work batched, and only the chunk-to-chunk state recurrence as a `lax.scan`. |
+
+```bash
+KERAS_HUB_QWEN3_5_GDN_IMPL=tpu python train.py ...
+```
+
+The variable is read when the layer is traced, so set it before the first
+compiled call. Same math as the reference: the tests in
+`qwen3_5_gated_delta_rule_tpu_test.py` check it against an independent float64
+token-by-token recurrence (including stress inputs), against the reference rule
+(forward and gradients), and a backbone's outputs and parameter gradients under
+both settings. Ported from the `gdn_fast_doubling` latency patch
+(`vla_archs_latency`, report of 2026-10-05: 0.984 s to 0.696 s per train step
+on a v6e-8 and 464 s to 95 s compile, measured there, not in this repo).
+
 ## Verified so far (JAX backend, CPU, float32)
 
 - Tiny random Qwen3.5 VLM (2 samples x 2 cameras, random-noise images): token

@@ -1,7 +1,30 @@
+import os
+
 import keras
 from keras import ops
 
 from keras_hub.src.models.qwen3_5.qwen3_5_layers import Qwen3_5RMSNormGated
+
+# Selects the chunked gated delta rule implementation, read at trace time:
+# "reference" (default) is the backend-agnostic loop below; "tpu" is the
+# restructured JAX version in `qwen3_5_gated_delta_rule_tpu.py`.
+GDN_IMPL_ENV_VAR = "KERAS_HUB_QWEN3_5_GDN_IMPL"
+GDN_IMPLS = ("reference", "tpu")
+
+
+def _gdn_impl():
+    """Return the chunked-rule implementation selected by the environment."""
+    impl = os.environ.get(GDN_IMPL_ENV_VAR, "reference")
+    if impl not in GDN_IMPLS:
+        raise ValueError(
+            f"{GDN_IMPL_ENV_VAR}={impl!r} is not one of {GDN_IMPLS}."
+        )
+    if impl == "tpu" and keras.config.backend() != "jax":
+        raise ValueError(
+            f"{GDN_IMPL_ENV_VAR}=tpu needs the JAX backend, but the backend "
+            f"is {keras.config.backend()!r}."
+        )
+    return impl
 
 
 def _l2norm(x, axis=-1, eps=1e-6):
@@ -84,6 +107,23 @@ def _chunk_gated_delta_rule(
         output: (B, seq, num_heads, head_v_dim)
         final_state: recurrent state or None
     """
+    if _gdn_impl() == "tpu":
+        from keras_hub.src.models.qwen3_5.qwen3_5_gated_delta_rule_tpu import (
+            chunk_gated_delta_rule_tpu,
+        )
+
+        return chunk_gated_delta_rule_tpu(
+            query,
+            key,
+            value,
+            g,
+            beta,
+            chunk_size = chunk_size,
+            initial_state = initial_state,
+            output_final_state = output_final_state,
+            padding_mask = padding_mask,
+        )
+
     query = _l2norm(query, axis=-1)
     key = _l2norm(key, axis=-1)
 
