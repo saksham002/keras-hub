@@ -32,7 +32,8 @@ def _inverse_by_masked_doubling(a):
     every diagonal (2 width)-block of `a`) is block diagonal with (2 width)
     blocks `[[T11, 0], [T22 a21 T11, T22]]`. Starting from `t = I`, log2(C)
     such levels give the full inverse: LAPACK's blocked forward substitution,
-    run as full-size matmuls at full float32 precision.
+    run as full-size matmuls. Like every other matmul in the model, they use
+    JAX's global matmul precision (`jax_default_matmul_precision`).
     """
     size = a.shape[-1]
     if size & (size - 1):
@@ -48,11 +49,7 @@ def _inverse_by_masked_doubling(a):
             (index[None, :] // width) % 2 == 0
         )
         pair_a = jnp.where(same_pair & lower_left, a, 0.0)
-        inverse = inverse + jnp.matmul(
-            jnp.matmul(inverse, pair_a, precision = "highest"),
-            inverse,
-            precision = "highest",
-        )
+        inverse = inverse + jnp.matmul(jnp.matmul(inverse, pair_a), inverse)
         width *= 2
     return inverse
 

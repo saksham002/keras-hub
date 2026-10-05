@@ -28,14 +28,16 @@ the linear-attention layers (training forward pass and the decode prefill):
 | Value | Implementation |
 | --- | --- |
 | `reference` (default, or unset) | The backend-agnostic rule in `qwen3_5_gated_delta_net.py`: each chunk's `(I - A)^-1` by a 63-step row loop, chunks as an unrolled Python loop. |
-| `tpu` (JAX only) | `qwen3_5_gated_delta_rule_tpu.py`: the inverse by six levels of masked block doubling (two full chunk x chunk matmuls per level at full float32 precision), all chunks' intra-chunk work batched, and only the chunk-to-chunk state recurrence as a `lax.scan`. |
+| `tpu` (JAX only) | `qwen3_5_gated_delta_rule_tpu.py`: the inverse by six levels of masked block doubling (two full chunk x chunk matmuls per level), all chunks' intra-chunk work batched, and only the chunk-to-chunk state recurrence as a `lax.scan`. |
 
 ```bash
 KERAS_HUB_QWEN3_5_GDN_IMPL=tpu python train.py ...
 ```
 
 The variable is read when the layer is traced, so set it before the first
-compiled call. Same math as the reference: the tests in
+compiled call. Neither implementation sets matmul precision; both follow JAX's
+global setting (e.g. `JAX_DEFAULT_MATMUL_PRECISION=highest` for full float32
+on TPU, whose default is a single bfloat16 pass). Same math as the reference: the tests in
 `qwen3_5_gated_delta_rule_tpu_test.py` check it against an independent float64
 token-by-token recurrence (including stress inputs), against the reference rule
 (forward and gradients), and a backbone's outputs and parameter gradients under
